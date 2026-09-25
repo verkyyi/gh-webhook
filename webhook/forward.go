@@ -87,20 +87,47 @@ func runFwd(out io.Writer, url, token, wsURL string, activateHook func() error) 
 	if url == "" {
 		fmt.Fprintln(os.Stderr, "notice: no `--url` specified; printing webhook payloads to stdout")
 	}
-	for i := 0; i < 3; i++ {
+	// The relay closes a long-lived socket with 1006 on its own schedule (observed
+	// every ~80s to ~5min), so a bounded retry just moves the exit a few minutes out.
+	// Reconnect for as long as the process lives: a socket that stayed up for a
+	// while resets the backoff, a socket that died straight away doubles it (5s → 5m).
+	backoff := reconnectBackoffMin
+	for {
+		started := time.Now()
 		err := handleWebsocket(out, url, token, wsURL, activateHook)
 		if err != nil {
-			// If the error is a server disconnect (1006), retry connecting
-			if isWebsocketCloseError(err, websocket.CloseAbnormalClosure) {
-				time.Sleep(5 * time.Second)
-				continue
-			} else if isWebsocketCloseError(err, websocket.CloseNormalClosure) {
+			if isWebsocketCloseError(err, websocket.CloseNormalClosure) {
 				return nil
 			}
-			return err
+			if !isWebsocketCloseError(err, websocket.CloseAbnormalClosure) {
+				return err
+			}
 		}
+		backoff = nextReconnectBackoff(backoff, time.Since(started))
+		fmt.Fprintf(os.Stderr, "notice: connection to webhooks server closed; reconnecting in %s\n", backoff)
+		time.Sleep(backoff)
 	}
-	return fmt.Errorf("unable to connect to webhooks server, forwarding stopped")
+}
+
+const (
+	reconnectBackoffMin = 5 * time.Second
+	reconnectBackoffMax = 5 * time.Minute
+	// A connection that lived at least this long counts as healthy: the next
+	// reconnect starts from the minimum backoff again.
+	reconnectHealthy = 30 * time.Second
+)
+
+// nextReconnectBackoff returns the wait before the next reconnect, given the
+// current wait and how long the connection that just closed had been up.
+func nextReconnectBackoff(current, connectedFor time.Duration) time.Duration {
+	if connectedFor >= reconnectHealthy {
+		return reconnectBackoffMin
+	}
+	next := current * 2
+	if next > reconnectBackoffMax {
+		next = reconnectBackoffMax
+	}
+	return next
 }
 
 func isWebsocketCloseError(err error, code int) bool {
