@@ -66,7 +66,12 @@ func (h *devHook) delete() error {
 	if h == nil || h.URL == "" {
 		return nil
 	}
-	return h.client.Delete(h.URL, nil)
+	err := h.client.Delete(h.URL, nil)
+	var apierr *api.HTTPError
+	if errors.As(err, &apierr) && apierr.StatusCode == http.StatusNotFound {
+		return nil // the relay already reaped it when it closed the session
+	}
+	return err
 }
 
 // createHook issues a request against the GitHub API to create a dev webhook
