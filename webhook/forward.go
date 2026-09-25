@@ -51,19 +51,21 @@ func NewCmdForward() *cobra.Command {
 				return fmt.Errorf("fatal: error fetching gh token: %w", err)
 			}
 
-			wsURL, activate, err := createHook(&hookOptions{
-				gitHubHost: githubHost,
-				eventTypes: eventTypes,
-				authToken:  authToken,
-				repo:       targetRepo,
-				org:        targetOrg,
-				secret:     webhookSecret,
-			})
+			newHook := func() (*devHook, error) {
+				return createHook(&hookOptions{
+					gitHubHost: githubHost,
+					eventTypes: eventTypes,
+					authToken:  authToken,
+					repo:       targetRepo,
+					org:        targetOrg,
+					secret:     webhookSecret,
+				})
+			}
+			hook, err := newHook()
 			if err != nil {
 				return err
 			}
-
-			return runFwd(os.Stdout, localURL, authToken, wsURL, activate)
+			return runFwd(os.Stdout, localURL, authToken, hook, newHook)
 		},
 	}
 
@@ -83,29 +85,46 @@ type wsEventReceived struct {
 	Body   []byte
 }
 
-func runFwd(out io.Writer, url, token, wsURL string, activateHook func() error) error {
+func runFwd(out io.Writer, url, token string, hook *devHook, newHook func() (*devHook, error)) error {
 	if url == "" {
 		fmt.Fprintln(os.Stderr, "notice: no `--url` specified; printing webhook payloads to stdout")
 	}
 	// The relay closes a long-lived socket with 1006 on its own schedule (observed
-	// every ~80s to ~5min), so a bounded retry just moves the exit a few minutes out.
-	// Reconnect for as long as the process lives: a socket that stayed up for a
-	// while resets the backoff, a socket that died straight away doubles it (5s → 5m).
+	// every ~80s to ~25min) and then refuses a second handshake on that session's
+	// ws_url (500 bad handshake). So a reconnect that means anything starts from a
+	// FRESH dev hook: drop the old one, create a new one, dial its ws_url. Keep at
+	// it for as long as the process lives — a socket that stayed up for a while
+	// resets the backoff, a socket that died straight away doubles it (5s → 5m);
+	// only a run of connections that never came up at all gives up.
 	backoff := reconnectBackoffMin
+	neverUp := 0
 	for {
 		started := time.Now()
-		err := handleWebsocket(out, url, token, wsURL, activateHook)
-		if err != nil {
-			if isWebsocketCloseError(err, websocket.CloseNormalClosure) {
-				return nil
-			}
-			if !isWebsocketCloseError(err, websocket.CloseAbnormalClosure) {
-				return err
-			}
+		err := handleWebsocket(out, url, token, hook.WsURL, hook.activate)
+		if err == nil || isWebsocketCloseError(err, websocket.CloseNormalClosure) {
+			return nil
 		}
-		backoff = nextReconnectBackoff(backoff, time.Since(started))
-		fmt.Fprintf(os.Stderr, "notice: connection to webhooks server closed; reconnecting in %s\n", backoff)
+		connectedFor := time.Since(started)
+		if connectedFor < reconnectHealthy {
+			neverUp++
+		} else {
+			neverUp = 0
+		}
+		if neverUp >= reconnectGiveUpAfter {
+			return fmt.Errorf("giving up after %d reconnects that never came up: %w", neverUp, err)
+		}
+		backoff = nextReconnectBackoff(backoff, connectedFor)
+		fmt.Fprintf(os.Stderr, "notice: %v; reconnecting on a fresh hook in %s\n", err, backoff)
 		time.Sleep(backoff)
+		fresh, nerr := newHook()
+		if nerr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not create a fresh hook (%v); retrying the old socket\n", nerr)
+			continue
+		}
+		if derr := hook.delete(); derr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not delete the old hook (%v); it stays inactive\n", derr)
+		}
+		hook = fresh
 	}
 }
 
@@ -115,6 +134,9 @@ const (
 	// A connection that lived at least this long counts as healthy: the next
 	// reconnect starts from the minimum backoff again.
 	reconnectHealthy = 30 * time.Second
+	// Consecutive connections shorter than reconnectHealthy before giving up: a
+	// bad token or a dead relay must not spin forever behind a supervisor.
+	reconnectGiveUpAfter = 10
 )
 
 // nextReconnectBackoff returns the wait before the next reconnect, given the

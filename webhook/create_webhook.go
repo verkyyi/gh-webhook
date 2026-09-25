@@ -45,14 +45,38 @@ type hookOptions struct {
 	secret     string
 }
 
+// devHook is a created dev webhook: the relay websocket to dial, plus the
+// REST calls that activate and (on reconnect) drop it.
+type devHook struct {
+	WsURL  string
+	URL    string
+	client *api.RESTClient
+}
+
+func (h *devHook) activate() error {
+	if err := h.client.Patch(h.URL, strings.NewReader(`{"active": true}`), nil); err != nil {
+		return fmt.Errorf("error activating webhook: %w", err)
+	}
+	return nil
+}
+
+// delete removes the dev hook. Best effort: a hook that outlives its socket is
+// only an inactive registration, so callers log and move on.
+func (h *devHook) delete() error {
+	if h == nil || h.URL == "" {
+		return nil
+	}
+	return h.client.Delete(h.URL, nil)
+}
+
 // createHook issues a request against the GitHub API to create a dev webhook
-func createHook(o *hookOptions) (string, func() error, error) {
+func createHook(o *hookOptions) (*devHook, error) {
 	apiClient, err := api.NewRESTClient(api.ClientOptions{
 		Host:      o.gitHubHost,
 		AuthToken: o.authToken,
 	})
 	if err != nil {
-		return "", nil, fmt.Errorf("error creating REST client: %w", err)
+		return nil, fmt.Errorf("error creating REST client: %w", err)
 	}
 	path := fmt.Sprintf("repos/%s/hooks", o.repo)
 	if o.org != "" {
@@ -72,25 +96,19 @@ func createHook(o *hookOptions) (string, func() error, error) {
 
 	reqBytes, err := json.Marshal(req)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	var res createHookResponse
 	err = apiClient.Post(path, bytes.NewReader(reqBytes), &res)
 	if err != nil {
 		var apierr *api.HTTPError
 		if errors.As(err, &apierr) && apierr.StatusCode == http.StatusForbidden {
-			return "", nil, fmt.Errorf("you do not have access to this feature")
+			return nil, fmt.Errorf("you do not have access to this feature")
 		}
-		return "", nil, fmt.Errorf("error creating webhook: %w", err)
+		return nil, fmt.Errorf("error creating webhook: %w", err)
 	}
 
-	return res.WsURL, func() error {
-		err := apiClient.Patch(res.URL, strings.NewReader(`{"active": true}`), nil)
-		if err != nil {
-			return fmt.Errorf("error activating webhook: %w", err)
-		}
-		return nil
-	}, nil
+	return &devHook{WsURL: res.WsURL, URL: res.URL, client: apiClient}, nil
 }
 
 func authTokenForHost(host string) (string, error) {
